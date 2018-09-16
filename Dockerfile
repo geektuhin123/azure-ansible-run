@@ -42,6 +42,7 @@ ENV ANSIBLE_SCP_IF_SSH=y
 # perms for the current files, not for those mounted as volumes later.
 COPY ansible /opt/turbot/ansible
 RUN chown -R turbotd:turbotd /opt/turbot/ansible
+COPY main.yml /opt/turbot/process/templates/rendered/playbook/main.yml
 
 # Default to the playbook location for running
 WORKDIR /opt/turbot/process/templates/rendered/playbook
