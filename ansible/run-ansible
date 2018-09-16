@@ -1,0 +1,298 @@
+#!/bin/bash
+
+
+#
+# SSH Functions
+#
+
+function ssh_connection_test {
+  # Run the test
+  echo "SSH connection test [$1@$2]: Starting 10 attempts over 5 mins..."
+  for attempt in `seq 1 10`; do
+    result=`ssh -v -i "$TURBOT_PRIVATE_KEY_FILE" -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=no "$1@$2" 'exit' 2>&1`
+    test_result="$?"
+    # SSH returns 255 on error, any other code indicates successful connection
+    if [ $test_result -ne 255 ]; then
+      echo "SSH connection test [$1@$2]: PASSED [${attempt}/10]"
+      return 0
+    fi
+    # Check for passing conditions
+    status_codes=("Permission denied")
+    for i in "${!status_codes[@]}"; do
+      echo "$result" | grep -q "${status_codes[$i]}"
+      if [ $? -eq 0 ]; then
+        echo "SSH connection test [$1@$2]: PASSED [${attempt}/10]"
+        return 1
+      fi
+    done
+    # Timeout - should have already waited, so continue to try immediately
+    echo "$result" | grep -q "Connection timed out"
+    if [ $? -eq 0 ]; then
+      echo "SSH connection test [$1@$2]: Connection timed out [${attempt}/10]"
+      continue
+    fi
+    # Refused - Perhaps server is still booting? Sleep and retry
+    echo "$result" | grep -q "Connection refused"
+    if [ $? -eq 0 ]; then
+      echo "SSH connection test [$1@$2]: Connection refused [${attempt}/10]"
+      sleep 20
+      continue
+    fi
+    # Unknown error
+    echo "SSH connection test [$1@$2]: Unknown error [${attempt}/10]"
+  done
+  echo "$result"
+  return 255
+}
+
+function ssh_login_test {
+  # Run the test
+  echo "SSH login test [$1@$2]: Starting 1 attempt over 30 secs..."
+  result=`ssh -v -i "$TURBOT_PRIVATE_KEY_FILE" -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=no "$1@$2" 'exit' 2>&1`
+  # SSH returns 255 on error, any other code indicates successful connection
+  if [ $? -ne 255 ]; then
+    echo "SSH login test [$1@$2]: PASSED"
+    return 0
+  fi
+  status_codes=("Permission denied" "Host key verification failed" "Connection timed out")
+  # Check permission denied
+  for i in "${!status_codes[@]}"; do
+    echo "$result" | grep -q "${status_codes[$i]}"
+    if [ $? -eq 0 ]; then
+      echo "SSH login test [$1@$2]: ${status_codes[$i]}"
+      return $((i+1))
+    fi
+  done
+  # Unknown error
+  echo "SSH login test [$1@$2]: Unknown error"
+  echo "$result"
+  return 255
+}
+
+#
+# Windows connectivity functions
+#
+
+function port_test {
+  # Run the test
+  echo "Port test [$1:$2]: Starting 10 attempts over 5 mins..."
+  for attempt in `seq 1 10`; do
+    echo "nc -zvw 1 $1 $2"
+    nc -zvw 30 $1 $2
+    test_result=$?
+    if [ $test_result -eq 0 ]; then
+      echo "Port test [$1:$2]: PASSED [${attempt}/10]"
+      return 0
+    fi
+  done
+  echo "$test_result"
+  return 1
+}
+
+function powershell_remoting_test {
+  echo "PowerShell remoting test for user '$windowsUserName': Starting 10 attempts over 5 mins..."
+
+  for attempt in `seq 1 10`; do
+    python /opt/turbot/ansible/checkPowerShellRemoting.py $TURBOT_REMOTE_HOST $windowsUserName $WINDOWS_USER_PASSWORD &> /dev/null
+	if [ $? -eq 0 ]; then
+	  echo "PowerShell remoting test: PASSED"
+	  return 0
+	else
+	  echo "PowerShell remoting test: FAILED"
+	fi
+	sleep 30
+  done
+  return 1
+}
+
+function gather_network_details {
+  echo "Checking DNS resolution (Requires UDP 4096):"
+  dig $1
+  echo
+  echo "Ping test (Requires ICMP):"
+  ping -c 2 $1
+  echo
+  # Requires UDP port range from (33434 + probes-per-hop) to ((33434 + probes-per-hop) + (max-ttl * probes-per-hop - 1))
+  # where max-ttl is 5
+  # and probes-per-hop is 3 (default)
+  echo "Tracing route (Requires UDP 33437 - 33451):"
+  traceroute -m 5 $1
+  echo
+  echo "Checking wheather port $2 is reachable"
+  nc -zv -w 10 $1 $2
+}
+
+
+#
+# SET UP ENVIRONMENT
+#
+echo "1). Create azure credential function"
+mkdir ~/.azure
+
+cat <<EOF > ~/.azure/credentials
+[default]
+subscription_id=$AZURE_SUBSCRIPTION_ID
+client_id=$AZURE_CLIENT_ID
+secret=$AZURE_SECRET
+tenant=$AZURE_TENANT
+EOF
+
+echo "2). Download all playbooks"
+az storage account check-name --name $AZURE_STORAGE_ACCOUNT_NAME
+az storage file download-batch --account-name $AZURE_STORAGE_ACCOUNT_NAME --account-key $AZURE_STORAGE_KEY -s $AZURE_PLAYBOOK_PATH -d /opt/turbot/process/templates/rendered/playbook
+
+echo "3). Create vars json file"
+python /opt/turbot/ansible/configureFile.py /opt/turbot/process/templates/rendered/playbook/vars.json "$TURBOT_CONTEXT"
+
+echo "4). Clone ansible inventory generation script"
+git clone git://github.com/ansible/ansible.git --recursive
+python ./ansible/contrib/inventory/azure_rm.py --host $TURBOT_REMOTE_HOST_GROUP --pretty
+cat <<EOF > ./hosts
+`python ./ansible/contrib/inventory/azure_rm.py --host $TURBOT_REMOTE_HOST_GROUP
+EOF
+
+echo "5). Create pem file for ssh"
+python /opt/turbot/ansible/configureFile.py $TURBOT_PRIVATE_KEY_FILE "$TURBOT_PRIVATE_KEY_DATA"
+chmod 400 $TURBOT_PRIVATE_KEY_FILE
+
+ansible-playbook --version
+#
+# Test Connectivity
+#
+
+if [ -n "${TURBOT_REMOTE_HOST}" ]; then
+
+  if ${IS_WINDOWS_INSTANCE} ; then
+    psRemotingPort=5986
+
+    port_test $TURBOT_REMOTE_HOST $psRemotingPort
+    if [ $? -gt 0 ]; then
+      # Connection timed out, or we had some other unexpected error
+      echo "Port test failed for port $psRemotingPort. Aborting Ansible run."
+      gather_network_details $TURBOT_REMOTE_HOST $psRemotingPort
+      exit 1
+    fi
+
+    windowsUserName='turbot'
+    powershell_remoting_test
+    if [ $? -gt 0 ]; then
+      # Connection timed out, or we had some other unexpected error
+      echo "PowerShell remoting test: failed. Aborting Ansible run."
+      gather_network_details $TURBOT_REMOTE_HOST $psRemotingPort
+      exit 1
+    fi
+    export ANSIBLE_REMOTE_USER="$windowsUserName"
+
+  else
+
+    # Define the login names that will be tested for SSH to the remote host.
+    TURBOT_REMOTE_HOST_LOGIN_NAMES="${TURBOT_REMOTE_HOST_LOGIN_NAMES:-turbotd;ubuntu;centos;hadoop;core;turbot;admin;root;clckwrk}"
+    IFS=';' read -ra LOGIN_NAMES <<< "$TURBOT_REMOTE_HOST_LOGIN_NAMES"
+
+    # Can we connect to SSH? (Or is it timing out?)
+    echo ""
+    ssh_connection_test "${LOGIN_NAMES[0]}" $TURBOT_REMOTE_HOST
+
+    case $? in
+    0)
+    # Passed first go!
+    ANSIBLE_REMOTE_USER="${LOGIN_NAMES[0]}"
+    ;;
+    1)
+    # Try all the login names for one that works
+    for i in "${LOGIN_NAMES[@]}"; do
+      ssh_login_test "$i" $TURBOT_REMOTE_HOST
+      if [ "$?" -eq 0 ]; then
+      ANSIBLE_REMOTE_USER="$i"
+      break
+      fi
+    done
+    ;;
+    esac
+
+    if [ -z "$ANSIBLE_REMOTE_USER" ]; then
+    # Connection timed out, or we had some other unexpected error
+    gather_network_details $TURBOT_REMOTE_HOST 22
+    echo "SSH connection failed. Aborting Ansible run."
+    exit 1
+    fi
+
+    echo "SSH connection OK for Ansible: ${ANSIBLE_REMOTE_USER}@${TURBOT_REMOTE_HOST}"
+    export ANSIBLE_REMOTE_USER="${ANSIBLE_REMOTE_USER}"
+  fi
+
+else
+
+  echo ""
+  echo "Using current user for Ansible: `whoami`"
+
+fi
+
+#
+# Ansible environment configuration
+#
+
+# coreos requires a different python interpreter path
+if [ "$ANSIBLE_REMOTE_USER" == "core" ]; then
+  export ansible_python_interpreter="/home/core/bin/python"
+fi
+
+
+
+#
+# Run Ansible
+#
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Output the version to the log.
+echo ""
+ansible-playbook --version
+
+if ${IS_WINDOWS_INSTANCE} ; then
+
+  extraVars="{\"ansible_user\":\"$windowsUserName\","\
+"\"ansible_password\":\"$WINDOWS_USER_PASSWORD\","\
+"\"ansible_port\":\"5986\","\
+"\"ansible_connection\":\"winrm\","\
+"\"ansible_winrm_transport\":\"credssp\","\
+"\"domain_admin_password\":\"$DOMAIN_ADMIN_PASSWORD\","\
+"\"ansible_winrm_server_cert_validation\":\"ignore\"}"
+
+  echo ""
+  echo "Ansible starting..."
+  ansible-playbook "$@" --extra-vars "$extraVars"
+
+else
+
+  echo ""
+  echo "Ensuring Ansible prerequisites are installed..."
+#  cp "$DIR/turbot-ansible-prerequisites.yml" "/opt/turbot/process/templates/rendered/playbook"
+#  ansible-playbook \
+#    --verbose \
+#   -i ansible/contrib/inventory/azure_rm.py --limit $TURBOT_REMOTE_HOST_GROUP \
+#   --private-key=/opt/turbot/ansible/$turbot.pem \
+#   turbot-ansible-prerequisites.yml
+# EXIT_CODE=$?
+# echo "Prerequisites finished with exit code ${EXIT_CODE}."
+
+  echo ""
+  echo "Ansible starting..."
+
+  ansible-playbook -i ansible/contrib/inventory/azure_rm.py main.yml --limit $TURBOT_REMOTE_HOST_GROUP --extra-vars "@vars.json" --extra-vars "--vvvv" "--private-key=$TURBOT_PRIVATE_KEY_FILE"
+  echo "Using current user for Ansible: `whoami`"
+
+fi
+
+EXIT_CODE=$?
+echo "Ansible finished with exit code ${EXIT_CODE}."
+
+echo ""
+echo ""
+echo "Log of environment variables for Ansible (excluding sensitive)..."
+env | grep -v AZURE_SECRET | grep -v TURBOT_PRIVATE_KEY_DATA | sort
+echo "End of environment variable list."
+echo ""
+
+# Exit with the status of the main ansible command
+exit $EXIT_CODE

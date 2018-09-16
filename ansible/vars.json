@@ -1,0 +1,1 @@
+{"context": { "clientContext": { "timezone": "Asia\/Kolkata", "options": { "Linux:Hostname": "Skip", "Linux:InstallInspectorAgent": "Skip", "Linux:InstallSSMAgent": false }, "resources": { "ec2Instance": { "Hostname": "mocked_hostname" } } } }}

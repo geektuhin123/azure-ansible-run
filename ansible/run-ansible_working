@@ -1,0 +1,79 @@
+#!/bin/bash
+
+
+#
+# SSH Functions
+#
+# Test Connectivity
+#
+# Ansible environment configuration
+#
+
+# coreos requires a different python interpreter path
+if [ "$ANSIBLE_REMOTE_USER" == "core" ]; then
+  export ansible_python_interpreter="/home/core/bin/python"
+fi
+# Run Ansible
+#
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+echo "-------- Debugging environment variables -------"
+echo $DIR
+echo $IS_WINDOWS_INSTANCE
+echo $ANSIBLE_SSH_PIPELINING
+echo $IS_WINDOWS_INSTANCE
+echo $ANSIBLE_SSH_ARGS
+echo $ANSIBLE_REMOTE_USER
+echo $TURBOT_PRIVATE_KEY_FILE
+echo $TURBOT_REMOTE_HOST
+echo $AZURE_PLAYBOOK_PATH
+echo $TURBOT_CONTEXT
+echo "data : ${TURBOT_PRIVATE_KEY_DATA}"
+echo $AZURE_STORAGE_KEY
+echo $AZURE_STORAGE_ACCOUNT_NAME
+echo $AZURE_PLAYBOOK_PATH
+echo $TURBOT_REMOTE_HOST_IP
+echo "-------- -------------- ------- --------------------"
+
+echo " ----- creating azure credentials file ----"
+mkdir ~/.azure
+
+cat <<EOF > ~/.azure/credentials
+[default]
+subscription_id=$AZURE_SUBSCRIPTION_ID
+client_id=$AZURE_CLIENT_ID
+secret=$AZURE_SECRET
+tenant=$AZURE_TENANT
+EOF
+
+cat ~/.azure/credentials
+
+az storage account check-name --name $AZURE_STORAGE_ACCOUNT_NAME
+az storage file download-batch --account-name $AZURE_STORAGE_ACCOUNT_NAME --account-key $AZURE_STORAGE_KEY -s $AZURE_PLAYBOOK_PATH -d /opt/turbot/process/templates/rendered/playbook
+# Output the version to the log.
+
+python /opt/turbot/ansible/configureFile.py /opt/turbot/process/templates/rendered/playbook/vars.json "$TURBOT_CONTEXT"
+
+echo "----- Clone ansible inventory generation script ----"
+git clone git://github.com/ansible/ansible.git --recursive
+
+python ./ansible/contrib/inventory/azure_rm.py --host $TURBOT_REMOTE_HOST --pretty
+
+cat <<EOF > ./hosts
+`python ./ansible/contrib/inventory/azure_rm.py --host $TURBOT_REMOTE_HOST
+EOF
+ls -la
+cat hosts
+
+python /opt/turbot/ansible/configureFile.py $TURBOT_PRIVATE_KEY_FILE "$TURBOT_PRIVATE_KEY_DATA"
+cat $TURBOT_PRIVATE_KEY_FILE
+chmod 400 $TURBOT_PRIVATE_KEY_FILE
+
+ls -la
+ansible-playbook --version
+echo "Printing vars json file"
+cat vars.json
+#ansible-playbook main.yml --extra-vars "@vars.json" --extra-vars "--vvvv" "--inventory-file=hosts" "--private-key=$TURBOT_PRIVATE_KEY_FILE"
+#ssh -q -o "BatchMode=yes" -i $TURBOT_PRIVATE_KEY_FILE turbotd@104.42.248.191 "echo 2>&1" && echo 104.42.248.191 SSH_OK || echo $host SSH_NOK
+ansible-playbook -i ansible/contrib/inventory/azure_rm.py main.yml --limit $TURBOT_REMOTE_HOST --extra-vars "@vars.json" --extra-vars "--vvvv" "--private-key=$TURBOT_PRIVATE_KEY_FILE"
+echo "Using current user for Ansible: `whoami`"

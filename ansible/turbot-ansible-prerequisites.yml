@@ -1,0 +1,47 @@
+---
+
+- hosts: all
+
+  gather_facts: no
+
+  become: yes
+
+  vars:
+    ansible_ssh_pipelining: no
+
+  pre_tasks:
+
+    - name: Check if Turbot Ansible prerequisites are already installed
+      raw: test -e /var/log/turbot/.turbot-ansible-prerequisites
+      changed_when: False
+      failed_when: False
+      register: prereqs_installed
+
+    - name: Install python 2.x & python-apt for Ansible on Ubuntu
+      when:
+        - prereqs_installed.rc != 0
+        - ansible_ssh_user == 'ubuntu'
+      raw: apt-get -qqy update && apt-get install -qqy python-minimal python-apt
+      register: install_python_result
+      changed_when: install_python_result.stdout != ""
+
+    - name: Do not requiretty in sudoers to enable Ansible pipelining
+      when: prereqs_installed.rc != 0
+      lineinfile:
+        dest: /etc/sudoers.d/turbot
+        line: "Defaults:{{ansible_ssh_user}} !requiretty"
+        state: present
+        create: yes
+        mode: 0440
+
+    - name: Create /var/log/turbot
+      when: prereqs_installed.rc != 0
+      file:
+        path: /var/log/turbot
+        state: directory
+
+    - name: Flag the instance as having Turbot prerequisites installed
+      when: prereqs_installed.rc != 0
+      file:
+        path: /var/log/turbot/.turbot-ansible-prerequisites
+        state: touch
